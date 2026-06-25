@@ -1132,6 +1132,28 @@ def repo_commit_file(path: str, content: str, message: str, branch: str = "main"
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+
+# --- Auto-Loader fuer Erweiterungs-Tools (ext_*.py) ---
+# Laedt jede Datei ext_*.py mit Funktion register(mcp, get_client, DEFAULT_CUSTOMER_ID, DRY_RUN).
+# Komplett in try/except gekapselt: ein Fehler hier darf den Serverstart NIE verhindern.
+try:
+    import importlib as _il
+    import pathlib as _pl
+    import sys as _sys
+    _ext_dir = _pl.Path(__file__).resolve().parent
+    if str(_ext_dir) not in _sys.path:
+        _sys.path.insert(0, str(_ext_dir))
+    for _f in sorted(_ext_dir.glob("ext_*.py")):
+        try:
+            _mod = _il.import_module(_f.stem)
+            if hasattr(_mod, "register"):
+                _mod.register(mcp, get_client, DEFAULT_CUSTOMER_ID, DRY_RUN)
+                print(f"[ext-load] {_f.name} registriert")
+        except Exception as _e:
+            print(f"[ext-load] {_f.name} FEHLER: {_e}")
+except Exception as _e:
+    print(f"[ext-load] Loader-Fehler: {_e}")
+
 # --- HTTP-App mit Bearer-Auth ---
 class BearerAuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
