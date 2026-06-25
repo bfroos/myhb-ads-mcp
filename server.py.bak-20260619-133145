@@ -1,0 +1,891 @@
+"""
+Google Ads MCP-Server für My Health & Beauty.
+Stellt lese- und schreibfähige Google-Ads-Tools über MCP (Streamable HTTP) bereit.
+Läuft auf bfr.roos.rocks hinter Caddy (Pfad /ads-mcp/). Secrets aus Umgebungsvariablen.
+
+Tools:
+ - run_gaql_report (lesen: beliebige GAQL-Reports)
+ - create_responsive_search_ad
+ - update_ad_status (ENABLED/PAUSED)
+ - add_negative_keywords (Anzeigengruppen-Ebene)
+ - add_keywords (positive Keywords, Anzeigengruppen-Ebene)
+ - set_keyword_status (bestehendes Keyword ENABLED/PAUSED, z.B. Niedrig-QS pausieren)
+ - create_campaign_budget / create_search_campaign / create_ad_group (Neuaufbau Such-Stadt)
+ - set_campaign_status / set_asset_group_status (Scharfschalten/Pausieren, PMax-Bereinigung)
+ - update_campaign_budget (Tagesbudget in EUR)
+
+Sicherheit:
+ - Bearer-Token-Schutz (CONNECTOR_TOKEN) auf dem HTTP-Endpoint.
+ - DRY_RUN=1 -> alle Schreib-Operationen laufen als validate_only (keine echten Änderungen).
+"""
+
+import os
+import json
+from functools import lru_cache
+
+from google.protobuf.json_format import MessageToDict
+from google.api_core import protobuf_helpers
+from google.ads.googleads.client import GoogleAdsClient
+
+from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse, PlainTextResponse
+from starlette.routing import Route
+import uvicorn
+
+DEFAULT_CUSTOMER_ID = os.environ.get("GOOGLE_ADS_CUSTOMER_ID", "7904003244")  # My Health & Beauty
+DRY_RUN = os.environ.get("DRY_RUN", "0") == "1"
+
+
+@lru_cache(maxsize=1)
+def get_client() -> GoogleAdsClient:
+    cfg = {
+        "developer_token": os.environ["GOOGLE_ADS_DEVELOPER_TOKEN"],
+        "client_id": os.environ["GOOGLE_ADS_CLIENT_ID"],
+        "client_secret": os.environ["GOOGLE_ADS_CLIENT_SECRET"],
+        "refresh_token": os.environ["GOOGLE_ADS_REFRESH_TOKEN"],
+        "use_proto_plus": True,
+    }
+    # login_customer_id nur setzen, wenn vorhanden (für 7904003244 = self/leer).
+    login = os.environ.get("GOOGLE_ADS_LOGIN_CUSTOMER_ID", "").strip()
+    if login:
+        cfg["login_customer_id"] = login
+    return GoogleAdsClient.load_from_dict(cfg)
+
+
+# Hinter Caddy laeuft der echte Host als bfr.roos.rocks durch; in der allowed-Liste
+# zulassen, sonst blockt der DNS-Rebinding-Schutz mit 421 "Invalid Host header".
+_sec = TransportSecuritySettings(
+    allowed_hosts=["bfr.roos.rocks", "127.0.0.1", "127.0.0.1:8090", "localhost"],
+    allowed_origins=["https://bfr.roos.rocks"],
+)
+mcp = FastMCP("google-ads", transport_security=_sec)
+
+
+@mcp.tool()
+def run_gaql_report(query: str, customer_id: str = "", limit: int = 200) -> str:
+    """Führt eine GAQL-Abfrage aus und gibt die Zeilen als JSON zurück.
+    Beispiel: "SELECT campaign.name, metrics.cost_micros, metrics.conversions FROM campaign WHERE segments.date DURING LAST_30_DAYS".
+    """
+    client = get_client()
+    cid = customer_id or DEFAULT_CUSTOMER_ID
+    ga = client.get_service("GoogleAdsService")
+    rows = []
+    done = False
+    for batch in ga.search_stream(customer_id=cid, query=query):
+        for row in batch.results:
+            rows.append(MessageToDict(row._pb))
+            if len(rows) >= limit:
+                done = True
+                break
+        if done:
+            break
+    return json.dumps({"customer_id": cid, "row_count": len(rows), "rows": rows}, ensure_ascii=False)
+
+
+def _text_asset(client, text: str):
+    asset = client.get_type("AdTextAsset")
+    asset.text = text
+    return asset
+
+
+@mcp.tool()
+def create_responsive_search_ad(
+    ad_group_id: str,
+    final_url: str,
+    headlines: list[str],
+    descriptions: list[str],
+    path1: str = "",
+    path2: str = "",
+    status: str = "ENABLED",
+    customer_id: str = "",
+) -> str:
+    """Legt eine neue responsive Suchanzeige (RSA) in einer bestehenden Anzeigengruppe an.
+    headlines: 3-15 Anzeigentitel (je <=30 Zeichen). descriptions: 2-4 Textzeilen (je <=90 Zeichen).
+    Wichtig: final_url muss auf go.myhealthandbeauty.com zeigen (Botox-frei), niemals .app.
+    """
+    client = get_client()
+    cid = customer_id or DEFAULT_CUSTOMER_ID
+    svc = client.get_service("AdGroupAdService")
+    ag_svc = client.get_service("AdGroupService")
+
+    op = client.get_type("AdGroupAdOperation")
+    aga = op.create
+    aga.ad_group = ag_svc.ad_group_path(cid, ad_group_id)
+    aga.status = client.enums.AdGroupAdStatusEnum[status]
+    ad = aga.ad
+    ad.final_urls.append(final_url)
+    rsa = ad.responsive_search_ad
+    if path1:
+        rsa.path1 = path1
+    if path2:
+        rsa.path2 = path2
+    rsa.headlines.extend([_text_asset(client, h) for h in headlines])
+    rsa.descriptions.extend([_text_asset(client, d) for d in descriptions])
+
+    request = client.get_type("MutateAdGroupAdsRequest")
+    request.customer_id = cid
+    request.operations.append(op)
+    request.validate_only = DRY_RUN
+    resp = svc.mutate_ad_group_ads(request=request)
+    rn = resp.results[0].resource_name if resp.results else None
+    return json.dumps({"dry_run": DRY_RUN, "resource_name": rn, "headlines": len(headlines), "descriptions": len(descriptions)})
+
+
+@mcp.tool()
+def update_ad_status(ad_group_id: str, ad_id: str, status: str, customer_id: str = "") -> str:
+    """Setzt den Status einer Anzeige: ENABLED oder PAUSED."""
+    client = get_client()
+    cid = customer_id or DEFAULT_CUSTOMER_ID
+    svc = client.get_service("AdGroupAdService")
+    op = client.get_type("AdGroupAdOperation")
+    aga = op.update
+    aga.resource_name = svc.ad_group_ad_path(cid, ad_group_id, ad_id)
+    aga.status = client.enums.AdGroupAdStatusEnum[status]
+    client.copy_from(op.update_mask, protobuf_helpers.field_mask(None, aga._pb))
+    request = client.get_type("MutateAdGroupAdsRequest")
+    request.customer_id = cid
+    request.operations.append(op)
+    request.validate_only = DRY_RUN
+    resp = svc.mutate_ad_group_ads(request=request)
+    return json.dumps({"dry_run": DRY_RUN, "resource_name": resp.results[0].resource_name if resp.results else None})
+
+
+@mcp.tool()
+def add_negative_keywords(ad_group_id: str, keywords: list[str], match_type: str = "PHRASE", customer_id: str = "") -> str:
+    """Fügt Negativ-Keywords auf Anzeigengruppen-Ebene hinzu. match_type: EXACT, PHRASE oder BROAD."""
+    client = get_client()
+    cid = customer_id or DEFAULT_CUSTOMER_ID
+    svc = client.get_service("AdGroupCriterionService")
+    ag_svc = client.get_service("AdGroupService")
+    ops = []
+    for kw in keywords:
+        op = client.get_type("AdGroupCriterionOperation")
+        c = op.create
+        c.ad_group = ag_svc.ad_group_path(cid, ad_group_id)
+        c.negative = True
+        c.keyword.text = kw
+        c.keyword.match_type = client.enums.KeywordMatchTypeEnum[match_type]
+        ops.append(op)
+    request = client.get_type("MutateAdGroupCriteriaRequest")
+    request.customer_id = cid
+    request.operations.extend(ops)
+    request.validate_only = DRY_RUN
+    resp = svc.mutate_ad_group_criteria(request=request)
+    return json.dumps({"dry_run": DRY_RUN, "added": len(resp.results)})
+
+
+@mcp.tool()
+def add_keywords(ad_group_id: str, keywords: list[str], match_type: str = "PHRASE", customer_id: str = "") -> str:
+    """Fuegt POSITIVE Keywords auf Anzeigengruppen-Ebene hinzu. match_type: EXACT, PHRASE oder BROAD.
+    Damit kann eine Anzeigengruppe ohne Keywords (z.B. Duesseldorf Jawline) ueberhaupt erst ausliefern.
+    Keywords werden mit Status ENABLED angelegt. Beispiel:
+    add_keywords(ad_group_id='123', keywords=['jawline aufbau','kinn aufspritzen','jawline filler'], match_type='PHRASE').
+    """
+    client = get_client()
+    cid = customer_id or DEFAULT_CUSTOMER_ID
+    svc = client.get_service("AdGroupCriterionService")
+    ag_svc = client.get_service("AdGroupService")
+    ops = []
+    for kw in keywords:
+        op = client.get_type("AdGroupCriterionOperation")
+        c = op.create
+        c.ad_group = ag_svc.ad_group_path(cid, ad_group_id)
+        c.status = client.enums.AdGroupCriterionStatusEnum["ENABLED"]
+        c.keyword.text = kw
+        c.keyword.match_type = client.enums.KeywordMatchTypeEnum[match_type]
+        ops.append(op)
+    request = client.get_type("MutateAdGroupCriteriaRequest")
+    request.customer_id = cid
+    request.operations.extend(ops)
+    request.validate_only = DRY_RUN
+    resp = svc.mutate_ad_group_criteria(request=request)
+    return json.dumps({"dry_run": DRY_RUN, "added": len(resp.results), "ad_group_id": ad_group_id})
+
+
+@mcp.tool()
+def set_keyword_status(ad_group_id: str, criterion_id: str, status: str, customer_id: str = "") -> str:
+    """Setzt den Status eines BESTEHENDEN Keywords (AdGroupCriterion): ENABLED oder PAUSED.
+    Praktisch, um Keywords mit niedrigem Quality-Score zu pausieren.
+    ad_group_id + criterion_id zuvor per run_gaql_report ermitteln, z.B.:
+    "SELECT ad_group.id, ad_group_criterion.criterion_id, ad_group_criterion.keyword.text,
+    ad_group_criterion.quality_info.quality_score FROM keyword_view
+    WHERE campaign.status = 'ENABLED' ORDER BY ad_group_criterion.quality_info.quality_score".
+    """
+    client = get_client()
+    cid = customer_id or DEFAULT_CUSTOMER_ID
+    svc = client.get_service("AdGroupCriterionService")
+    op = client.get_type("AdGroupCriterionOperation")
+    c = op.update
+    c.resource_name = svc.ad_group_criterion_path(cid, ad_group_id, criterion_id)
+    c.status = client.enums.AdGroupCriterionStatusEnum[status]
+    client.copy_from(op.update_mask, protobuf_helpers.field_mask(None, c._pb))
+    request = client.get_type("MutateAdGroupCriteriaRequest")
+    request.customer_id = cid
+    request.operations.append(op)
+    request.validate_only = DRY_RUN
+    resp = svc.mutate_ad_group_criteria(request=request)
+    return json.dumps({"dry_run": DRY_RUN, "resource_name": resp.results[0].resource_name if resp.results else None})
+
+
+@mcp.tool()
+def update_campaign_budget(campaign_budget_id: str, amount_eur: float, customer_id: str = "") -> str:
+    """Ändert das Tagesbudget (in EUR) eines CampaignBudget-Objekts.
+    Tipp: campaign_budget_id zuvor per run_gaql_report ermitteln
+    ("SELECT campaign.name, campaign_budget.id, campaign_budget.amount_micros FROM campaign_budget").
+    """
+    client = get_client()
+    cid = customer_id or DEFAULT_CUSTOMER_ID
+    svc = client.get_service("CampaignBudgetService")
+    op = client.get_type("CampaignBudgetOperation")
+    b = op.update
+    b.resource_name = svc.campaign_budget_path(cid, campaign_budget_id)
+    b.amount_micros = int(round(amount_eur * 1_000_000))
+    client.copy_from(op.update_mask, protobuf_helpers.field_mask(None, b._pb))
+    request = client.get_type("MutateCampaignBudgetsRequest")
+    request.customer_id = cid
+    request.operations.append(op)
+    request.validate_only = DRY_RUN
+    resp = svc.mutate_campaign_budgets(request=request)
+    return json.dumps({"dry_run": DRY_RUN, "resource_name": resp.results[0].resource_name if resp.results else None})
+
+
+# --- Erstell-Tools: Budget, Kampagne, Anzeigengruppe, Status ---
+# Flow Search-Stadt: create_campaign_budget -> create_search_campaign
+# -> create_ad_group (je Thema) -> add_keywords + create_responsive_search_ad
+# -> set_campaign_status ENABLED nach Verifikation.
+
+@mcp.tool()
+def create_campaign_budget(name: str, amount_eur: float, customer_id: str = "") -> str:
+    """Legt ein (nicht geteiltes) Tagesbudget an und gibt budget_id zurueck.
+    amount_eur = Tagesbudget in EUR. Danach mit create_search_campaign verwenden.
+    """
+    client = get_client()
+    cid = customer_id or DEFAULT_CUSTOMER_ID
+    svc = client.get_service("CampaignBudgetService")
+    op = client.get_type("CampaignBudgetOperation")
+    b = op.create
+    b.name = name
+    b.amount_micros = int(round(amount_eur * 1_000_000))
+    b.delivery_method = client.enums.BudgetDeliveryMethodEnum.STANDARD
+    b.explicitly_shared = False
+    req = client.get_type("MutateCampaignBudgetsRequest")
+    req.customer_id = cid
+    req.operations.append(op)
+    req.validate_only = DRY_RUN
+    resp = svc.mutate_campaign_budgets(request=req)
+    rn = resp.results[0].resource_name if resp.results else None
+    bid = rn.split("/")[-1] if rn else None
+    return json.dumps({"dry_run": DRY_RUN, "budget_id": bid, "resource_name": rn})
+
+
+@mcp.tool()
+def create_search_campaign(
+    name: str,
+    budget_id: str,
+    geo_target_ids: list[str],
+    language_ids: list[str] = ["1000", "1001"],
+    status: str = "PAUSED",
+    customer_id: str = "",
+) -> str:
+    """Legt eine Such-Kampagne an (Gebotsstrategie MAXIMIZE_CONVERSIONS, Display AUS,
+    Suchnetz AN) inkl. Geo- und Sprach-Targeting. Wird per Default PAUSED angelegt
+    (erst nach Verifikation per set_campaign_status scharf schalten).
+    geo_target_ids: Liste von GeoTargetConstant-IDs (z.B. ['1004576'] = Aachen Stadt).
+    language_ids: Default DE(1000)+EN(1001). status: PAUSED oder ENABLED.
+    Brand-Ausschluss laeuft konto-weit automatisch (account-level negatives).
+    Gibt campaign_id zurueck.
+    """
+    client = get_client()
+    cid = customer_id or DEFAULT_CUSTOMER_ID
+    csvc = client.get_service("CampaignService")
+    bsvc = client.get_service("CampaignBudgetService")
+    op = client.get_type("CampaignOperation")
+    camp = op.create
+    camp.name = name
+    camp.advertising_channel_type = client.enums.AdvertisingChannelTypeEnum.SEARCH
+    camp.status = client.enums.CampaignStatusEnum[status]
+    camp.campaign_budget = bsvc.campaign_budget_path(cid, budget_id)
+    camp.maximize_conversions = client.get_type("MaximizeConversions")
+    camp.bidding_strategy_type = client.enums.BiddingStrategyTypeEnum.MAXIMIZE_CONVERSIONS
+    ns = camp.network_settings
+    ns.target_google_search = True
+    ns.target_search_network = True
+    ns.target_content_network = False
+    ns.target_partner_search_network = False
+    camp.geo_target_type_setting.positive_geo_target_type = client.enums.PositiveGeoTargetTypeEnum.PRESENCE_OR_INTEREST
+    camp.geo_target_type_setting.negative_geo_target_type = client.enums.NegativeGeoTargetTypeEnum.PRESENCE
+    camp.contains_eu_political_advertising = client.enums.EuPoliticalAdvertisingStatusEnum.DOES_NOT_CONTAIN_EU_POLITICAL_ADVERTISING
+    req = client.get_type("MutateCampaignsRequest")
+    req.customer_id = cid
+    req.operations.append(op)
+    req.validate_only = DRY_RUN
+    resp = csvc.mutate_campaigns(request=req)
+    rn = resp.results[0].resource_name if resp.results else None
+    camp_id = rn.split("/")[-1] if rn else None
+    # Geo + Sprache als CampaignCriterion ergaenzen
+    if rn and not DRY_RUN:
+        cc_svc = client.get_service("CampaignCriterionService")
+        geo_svc = client.get_service("GeoTargetConstantService")
+        ops = []
+        for gid in geo_target_ids:
+            o = client.get_type("CampaignCriterionOperation")
+            o.create.campaign = rn
+            o.create.location.geo_target_constant = geo_svc.geo_target_constant_path(gid)
+            ops.append(o)
+        for lg in language_ids:
+            o = client.get_type("CampaignCriterionOperation")
+            o.create.campaign = rn
+            o.create.language.language_constant = f"languageConstants/{lg}"
+            ops.append(o)
+        creq = client.get_type("MutateCampaignCriteriaRequest")
+        creq.customer_id = cid
+        creq.operations.extend(ops)
+        cc_svc.mutate_campaign_criteria(request=creq)
+    return json.dumps({"dry_run": DRY_RUN, "campaign_id": camp_id, "resource_name": rn,
+                       "geo": geo_target_ids, "languages": language_ids, "status": status})
+
+
+@mcp.tool()
+def create_ad_group(campaign_id: str, name: str, status: str = "ENABLED", customer_id: str = "") -> str:
+    """Legt eine Standard-Such-Anzeigengruppe in einer Kampagne an. Gibt ad_group_id zurueck.
+    Danach add_keywords + create_responsive_search_ad auf diese ad_group_id anwenden.
+    """
+    client = get_client()
+    cid = customer_id or DEFAULT_CUSTOMER_ID
+    svc = client.get_service("AdGroupService")
+    csvc = client.get_service("CampaignService")
+    op = client.get_type("AdGroupOperation")
+    ag = op.create
+    ag.name = name
+    ag.campaign = csvc.campaign_path(cid, campaign_id)
+    ag.type_ = client.enums.AdGroupTypeEnum.SEARCH_STANDARD
+    ag.status = client.enums.AdGroupStatusEnum[status]
+    req = client.get_type("MutateAdGroupsRequest")
+    req.customer_id = cid
+    req.operations.append(op)
+    req.validate_only = DRY_RUN
+    resp = svc.mutate_ad_groups(request=req)
+    rn = resp.results[0].resource_name if resp.results else None
+    agid = rn.split("/")[-1] if rn else None
+    return json.dumps({"dry_run": DRY_RUN, "ad_group_id": agid, "resource_name": rn})
+
+
+@mcp.tool()
+def set_campaign_status(campaign_id: str, status: str, customer_id: str = "") -> str:
+    """Setzt den Status einer Kampagne: ENABLED oder PAUSED. Zum Scharfschalten/Pausieren."""
+    client = get_client()
+    cid = customer_id or DEFAULT_CUSTOMER_ID
+    svc = client.get_service("CampaignService")
+    op = client.get_type("CampaignOperation")
+    camp = op.update
+    camp.resource_name = svc.campaign_path(cid, campaign_id)
+    camp.status = client.enums.CampaignStatusEnum[status]
+    client.copy_from(op.update_mask, protobuf_helpers.field_mask(None, camp._pb))
+    req = client.get_type("MutateCampaignsRequest")
+    req.customer_id = cid
+    req.operations.append(op)
+    req.validate_only = DRY_RUN
+    resp = svc.mutate_campaigns(request=req)
+    return json.dumps({"dry_run": DRY_RUN, "resource_name": resp.results[0].resource_name if resp.results else None, "status": status})
+
+
+@mcp.tool()
+def set_asset_group_status(asset_group_id: str, status: str, customer_id: str = "") -> str:
+    """Setzt den Status einer PMax-Asset-Gruppe: ENABLED, PAUSED oder REMOVED.
+    Praktisch, um in einer PMax-Kampagne breite Asset-Gruppen zu pausieren und nur
+    fokussierte (themen-genaue) aktiv zu lassen.
+    asset_group_id per run_gaql_report finden
+    ("SELECT asset_group.id, asset_group.name, asset_group.status FROM asset_group WHERE campaign.id=...").
+    """
+    client = get_client()
+    cid = customer_id or DEFAULT_CUSTOMER_ID
+    svc = client.get_service("AssetGroupService")
+    op = client.get_type("AssetGroupOperation")
+    ag = op.update
+    ag.resource_name = svc.asset_group_path(cid, asset_group_id)
+    ag.status = client.enums.AssetGroupStatusEnum[status]
+    client.copy_from(op.update_mask, protobuf_helpers.field_mask(None, ag._pb))
+    req = client.get_type("MutateAssetGroupsRequest")
+    req.customer_id = cid
+    req.operations.append(op)
+    req.validate_only = DRY_RUN
+    resp = svc.mutate_asset_groups(request=req)
+    return json.dumps({"dry_run": DRY_RUN, "resource_name": resp.results[0].resource_name if resp.results else None, "status": status})
+
+
+@mcp.tool()
+def update_conversion_action(
+    conversion_action_id: str,
+    primary_for_goal: str = "",
+    counting_type: str = "",
+    customer_id: str = "",
+) -> str:
+    """Aendert eine Conversion-Aktion.
+    primary_for_goal: "true" (primaer/biddable) oder "false" (sekundaer). Leer = nicht aendern.
+    counting_type: "ONE_PER_CLICK" oder "MANY_PER_CLICK". Leer = nicht aendern.
+    conversion_action_id zuvor per run_gaql_report ermitteln
+    ("SELECT conversion_action.id, conversion_action.name, conversion_action.primary_for_goal,
+    conversion_action.counting_type FROM conversion_action")."""
+    client = get_client()
+    cid = customer_id or DEFAULT_CUSTOMER_ID
+    svc = client.get_service("ConversionActionService")
+    op = client.get_type("ConversionActionOperation")
+    ca = op.update
+    ca.resource_name = svc.conversion_action_path(cid, conversion_action_id)
+    if primary_for_goal:
+        ca.primary_for_goal = (primary_for_goal.lower() == "true")
+    if counting_type:
+        ca.counting_type = client.enums.ConversionActionCountingTypeEnum[counting_type]
+    client.copy_from(op.update_mask, protobuf_helpers.field_mask(None, ca._pb))
+    request = client.get_type("MutateConversionActionsRequest")
+    request.customer_id = cid
+    request.operations.append(op)
+    request.validate_only = DRY_RUN
+    resp = svc.mutate_conversion_actions(request=request)
+    return json.dumps({"dry_run": DRY_RUN, "resource_name": resp.results[0].resource_name if resp.results else None})
+
+
+# --- Asset-Tools (Sitelinks, Callouts, Structured Snippets) ---
+# Flow: Asset(s) anlegen -> resource_name(s) -> an Kampagne binden (CampaignAsset).
+
+def _create_assets(client, cid: str, ops: list):
+    """Legt Assets an und gibt deren resource_names zurueck (respektiert DRY_RUN)."""
+    svc = client.get_service("AssetService")
+    req = client.get_type("MutateAssetsRequest")
+    req.customer_id = cid
+    req.operations.extend(ops)
+    req.validate_only = DRY_RUN
+    resp = svc.mutate_assets(request=req)
+    return [r.resource_name for r in resp.results]
+
+
+def _link_assets_to_campaign(client, cid: str, campaign_id: str, asset_resource_names: list, field_type: str):
+    """Bindet Assets per CampaignAsset an eine Kampagne (respektiert DRY_RUN)."""
+    camp_svc = client.get_service("CampaignService")
+    ca_svc = client.get_service("CampaignAssetService")
+    req = client.get_type("MutateCampaignAssetsRequest")
+    req.customer_id = cid
+    for rn in asset_resource_names:
+        op = client.get_type("CampaignAssetOperation")
+        op.create.campaign = camp_svc.campaign_path(cid, campaign_id)
+        op.create.asset = rn
+        op.create.field_type = client.enums.AssetFieldTypeEnum[field_type]
+        req.operations.append(op)
+    req.validate_only = DRY_RUN
+    resp = ca_svc.mutate_campaign_assets(request=req)
+    return [r.resource_name for r in resp.results]
+
+
+@mcp.tool()
+def get_campaign_id_by_name(name_contains: str, customer_id: str = "") -> str:
+    """Sucht ENABLED-Kampagnen, deren Name den Text enthaelt, und gibt id+name als JSON zurueck.
+    Praktisch, um die campaign_id fuer die Asset-Tools zu finden.
+    """
+    client = get_client()
+    cid = customer_id or DEFAULT_CUSTOMER_ID
+    ga = client.get_service("GoogleAdsService")
+    q = "SELECT campaign.id, campaign.name, campaign.status FROM campaign WHERE campaign.status = 'ENABLED'"
+    hits = []
+    for b in ga.search_stream(customer_id=cid, query=q):
+        for r in b.results:
+            if name_contains.lower() in r.campaign.name.lower():
+                hits.append({"id": str(r.campaign.id), "name": r.campaign.name})
+    return json.dumps({"matches": hits}, ensure_ascii=False)
+
+
+@mcp.tool()
+def add_callouts(campaign_id: str, callouts: list[str], customer_id: str = "") -> str:
+    """Legt Callout-Assets an und bindet sie an die Kampagne (Kampagnen-Ebene).
+    callouts: kurze Vorteilstexte je <=25 Zeichen, z.B. ['Erfahrene Aerzte','Faire Preise','Termin in 24h','Kostenlose Beratung'].
+    Mindestens 2 sinnvoll; Google zeigt sie unter der Anzeige.
+    """
+    client = get_client()
+    cid = customer_id or DEFAULT_CUSTOMER_ID
+    ops = []
+    for txt in callouts:
+        op = client.get_type("AssetOperation")
+        op.create.callout_asset.callout_text = txt
+        ops.append(op)
+    asset_rns = _create_assets(client, cid, ops)
+    links = []
+    if asset_rns:
+        links = _link_assets_to_campaign(client, cid, campaign_id, asset_rns, "CALLOUT")
+    return json.dumps({"dry_run": DRY_RUN, "assets_created": len(asset_rns), "linked": len(links), "campaign_id": campaign_id})
+
+
+@mcp.tool()
+def add_structured_snippet(campaign_id: str, header: str, values: list[str], customer_id: str = "") -> str:
+    """Legt ein Structured-Snippet-Asset an und bindet es an die Kampagne.
+    header MUSS aus Googles Liste stammen (DE z.B.: 'Dienstleistungen', 'Typen', 'Marken', 'Stile', 'Services').
+    values: 3-10 Eintraege je <=25 Zeichen, z.B. ['Lippen','Jawline','Profhilo','Botox','Hyaluron'].
+    """
+    client = get_client()
+    cid = customer_id or DEFAULT_CUSTOMER_ID
+    op = client.get_type("AssetOperation")
+    op.create.structured_snippet_asset.header = header
+    op.create.structured_snippet_asset.values.extend(values)
+    asset_rns = _create_assets(client, cid, [op])
+    links = []
+    if asset_rns:
+        links = _link_assets_to_campaign(client, cid, campaign_id, asset_rns, "STRUCTURED_SNIPPET")
+    return json.dumps({"dry_run": DRY_RUN, "assets_created": len(asset_rns), "linked": len(links), "header": header, "campaign_id": campaign_id})
+
+
+@mcp.tool()
+def add_sitelinks(campaign_id: str, sitelinks: list[dict], customer_id: str = "") -> str:
+    """Legt Sitelink-Assets an und bindet sie an die Kampagne.
+    sitelinks: Liste von Objekten mit Keys: link_text (<=25 Z.), final_url (Pflicht, go.myhealthandbeauty.com),
+    optional description1 / description2 (je <=35 Z.).
+    Beispiel: [{"link_text":"Preise","final_url":"https://go.myhealthandbeauty.com/preise","description1":"Transparent","description2":"Jetzt ansehen"}].
+    """
+    client = get_client()
+    cid = customer_id or DEFAULT_CUSTOMER_ID
+    ops = []
+    for sl in sitelinks:
+        op = client.get_type("AssetOperation")
+        a = op.create.sitelink_asset
+        a.link_text = sl["link_text"]
+        if sl.get("description1"):
+            a.description1 = sl["description1"]
+        if sl.get("description2"):
+            a.description2 = sl["description2"]
+        op.create.final_urls.append(sl["final_url"])
+        ops.append(op)
+    asset_rns = _create_assets(client, cid, ops)
+    links = []
+    if asset_rns:
+        links = _link_assets_to_campaign(client, cid, campaign_id, asset_rns, "SITELINK")
+    return json.dumps({"dry_run": DRY_RUN, "assets_created": len(asset_rns), "linked": len(links), "campaign_id": campaign_id})
+
+
+# --- Weitere Asset-Tools: Call, Price, Business Name, Logo ---
+
+@mcp.tool()
+def add_call(campaign_id: str, phone_number: str, country_code: str = "DE", customer_id: str = "") -> str:
+    """Legt ein Anruf-Asset an und bindet es an die Kampagne (CALL).
+    phone_number z.B. '+49 221 1234567', country_code ISO-2 (Default DE).
+    """
+    client = get_client()
+    cid = customer_id or DEFAULT_CUSTOMER_ID
+    op = client.get_type("AssetOperation")
+    op.create.call_asset.country_code = country_code
+    op.create.call_asset.phone_number = phone_number
+    asset_rns = _create_assets(client, cid, [op])
+    links = _link_assets_to_campaign(client, cid, campaign_id, asset_rns, "CALL") if asset_rns else []
+    return json.dumps({"dry_run": DRY_RUN, "assets_created": len(asset_rns), "linked": len(links), "campaign_id": campaign_id})
+
+
+@mcp.tool()
+def add_price(campaign_id: str, offerings: list[dict], price_type: str = "SERVICES", qualifier: str = "FROM", language_code: str = "de", customer_id: str = "") -> str:
+    """Legt ein Preis-Asset (3-8 Angebote) an und bindet es an die Kampagne (PRICE).
+    offerings: Liste mit Keys header (<=25 Z.), description (<=25 Z.), amount_eur (Zahl), final_url.
+    Beispiel: [{"header":"Lippen aufspritzen","description":"Hyaluron Lippen","amount_eur":199,"final_url":"https://go.myhealthandbeauty.com/lippen"}].
+    price_type: SERVICES (Default). qualifier: FROM/UP_TO/AVERAGE. Mind. 3 Angebote noetig.
+    """
+    client = get_client()
+    cid = customer_id or DEFAULT_CUSTOMER_ID
+    op = client.get_type("AssetOperation")
+    pa = op.create.price_asset
+    pa.type_ = client.enums.PriceExtensionTypeEnum[price_type]
+    pa.price_qualifier = client.enums.PriceExtensionPriceQualifierEnum[qualifier]
+    pa.language_code = language_code
+    for off in offerings:
+        o = client.get_type("PriceOffering")
+        o.header = off["header"]
+        o.description = off.get("description", "")
+        o.price.amount_micros = int(round(float(off["amount_eur"]) * 1_000_000))
+        o.price.currency_code = off.get("currency_code", "EUR")
+        o.final_url = off["final_url"]
+        pa.price_offerings.append(o)
+    asset_rns = _create_assets(client, cid, [op])
+    links = _link_assets_to_campaign(client, cid, campaign_id, asset_rns, "PRICE") if asset_rns else []
+    return json.dumps({"dry_run": DRY_RUN, "assets_created": len(asset_rns), "linked": len(links), "offerings": len(offerings), "campaign_id": campaign_id})
+
+
+@mcp.tool()
+def add_business_name(campaign_id: str, business_name: str = "MY HEALTH & BEAUTY", customer_id: str = "") -> str:
+    """Legt ein Firmenname-Asset (TextAsset) an und bindet es an die Kampagne (BUSINESS_NAME)."""
+    client = get_client()
+    cid = customer_id or DEFAULT_CUSTOMER_ID
+    op = client.get_type("AssetOperation")
+    op.create.text_asset.text = business_name
+    asset_rns = _create_assets(client, cid, [op])
+    links = _link_assets_to_campaign(client, cid, campaign_id, asset_rns, "BUSINESS_NAME") if asset_rns else []
+    return json.dumps({"dry_run": DRY_RUN, "assets_created": len(asset_rns), "linked": len(links), "campaign_id": campaign_id})
+
+
+@mcp.tool()
+def add_logo(campaign_id: str, asset_id: str, customer_id: str = "") -> str:
+    """Bindet ein vorhandenes Logo-Bild-Asset (per ID aus list_image_assets) an die Kampagne (BUSINESS_LOGO).
+    Tipp: list_image_assets(name_contains='logo') nutzen, um Logo-Assets zu finden. Quadratisch (1:1) empfohlen.
+    """
+    client = get_client()
+    cid = customer_id or DEFAULT_CUSTOMER_ID
+    asset_svc = client.get_service("AssetService")
+    rn = asset_svc.asset_path(cid, asset_id)
+    links = _link_assets_to_campaign(client, cid, campaign_id, [rn], "BUSINESS_LOGO")
+    return json.dumps({"dry_run": DRY_RUN, "linked": len(links), "campaign_id": campaign_id})
+
+
+# --- Bild-Asset-Tools ---
+# AD_IMAGE = korrekter Feldtyp fuer Bilderweiterungen bei SUCH-Kampagnen
+# (MARKETING_IMAGE etc. sind dort inkompatibel). Verifiziert 2026-06-17.
+
+@mcp.tool()
+def list_image_assets(name_contains: str = "", min_width: int = 0, min_height: int = 0, limit: int = 50, customer_id: str = "") -> str:
+    """Listet Bild-Assets aus der Asset-Bibliothek (zum Wiederverwenden per add_image_extension).
+    Optional filtern nach Namens-Teilstring und Mindestgroesse. Gibt id, name, width, height zurueck.
+    """
+    client = get_client()
+    cid = customer_id or DEFAULT_CUSTOMER_ID
+    ga = client.get_service("GoogleAdsService")
+    q = ("SELECT asset.id, asset.name, asset.image_asset.full_size.width_pixels, "
+         "asset.image_asset.full_size.height_pixels FROM asset WHERE asset.type = 'IMAGE'")
+    out = []
+    for b in ga.search_stream(customer_id=cid, query=q):
+        for r in b.results:
+            w = r.asset.image_asset.full_size.width_pixels
+            h = r.asset.image_asset.full_size.height_pixels
+            nm = r.asset.name or ""
+            if name_contains and name_contains.lower() not in nm.lower():
+                continue
+            if w < min_width or h < min_height:
+                continue
+            out.append({"id": str(r.asset.id), "name": nm, "w": w, "h": h})
+            if len(out) >= limit:
+                break
+        if len(out) >= limit:
+            break
+    return json.dumps({"count": len(out), "assets": out}, ensure_ascii=False)
+
+
+@mcp.tool()
+def add_image_extension(campaign_id: str, asset_ids: list[str], customer_id: str = "") -> str:
+    """Bindet vorhandene Bild-Assets (per ID aus list_image_assets) als Bilderweiterung (AD_IMAGE)
+    an eine Such-Kampagne. Kein Upload noetig - nutzt Material aus der Bibliothek.
+    Empfohlen: quadratische (1:1) und Landscape (1.91:1) Bilder >=300px.
+    """
+    client = get_client()
+    cid = customer_id or DEFAULT_CUSTOMER_ID
+    asset_svc = client.get_service("AssetService")
+    rns = [asset_svc.asset_path(cid, aid) for aid in asset_ids]
+    links = _link_assets_to_campaign(client, cid, campaign_id, rns, "AD_IMAGE")
+    return json.dumps({"dry_run": DRY_RUN, "linked": len(links), "campaign_id": campaign_id})
+
+
+@mcp.tool()
+def upload_image_asset(image_url: str, name: str, customer_id: str = "") -> str:
+    """Laedt ein Bild von einer URL herunter und legt es als neues Bild-Asset in der Bibliothek an.
+    Gibt die neue asset_id zurueck (danach mit add_image_extension verknuepfbar).
+    Fuer KI-generierte Motive: Bild zuerst extern erzeugen/hosten, dann hier per URL hochladen.
+    PNG/JPG, empfohlen 1200x1200 (1:1) oder 1200x628 (1.91:1), max ~5MB.
+    """
+    import urllib.request
+    client = get_client()
+    cid = customer_id or DEFAULT_CUSTOMER_ID
+    with urllib.request.urlopen(image_url, timeout=30) as resp:
+        data = resp.read()
+    svc = client.get_service("AssetService")
+    op = client.get_type("AssetOperation")
+    op.create.name = name
+    op.create.type_ = client.enums.AssetTypeEnum["IMAGE"]
+    op.create.image_asset.data = data
+    req = client.get_type("MutateAssetsRequest")
+    req.customer_id = cid
+    req.operations.append(op)
+    req.validate_only = DRY_RUN
+    r = svc.mutate_assets(request=req)
+    rn = r.results[0].resource_name if r.results else None
+    aid = rn.split("/")[-1] if rn else None
+    return json.dumps({"dry_run": DRY_RUN, "asset_id": aid, "resource_name": rn, "bytes": len(data)})
+
+
+# --- PMax Asset-Gruppen-Ebene-Tools ---
+# Bei PMax sitzen Logo/BusinessName/Headlines/Bilder auf der ASSET-GROUP (AssetGroupAsset).
+# Sitelinks/Callouts/Snippets/Call/Price laufen auf Kampagnen-Ebene (CampaignAsset, s.o.) und
+# gelten dort automatisch fuer die ganze PMax-Kampagne.
+
+def _agasset_link(client, cid, asset_group_id, asset_rn, field_type):
+    """Bindet ein vorhandenes Asset (resource_name) an eine Asset-Gruppe (respektiert DRY_RUN)."""
+    ag_svc = client.get_service("AssetGroupService")
+    svc = client.get_service("AssetGroupAssetService")
+    op = client.get_type("AssetGroupAssetOperation")
+    op.create.asset_group = ag_svc.asset_group_path(cid, asset_group_id)
+    op.create.asset = asset_rn
+    op.create.field_type = client.enums.AssetFieldTypeEnum[field_type]
+    req = client.get_type("MutateAssetGroupAssetsRequest")
+    req.customer_id = cid
+    req.operations.append(op)
+    req.validate_only = DRY_RUN
+    resp = svc.mutate_asset_group_assets(request=req)
+    return resp.results[0].resource_name if resp.results else None
+
+
+@mcp.tool()
+def link_image_to_asset_group(asset_group_id: str, asset_id: str, field_type: str = "MARKETING_IMAGE", customer_id: str = "") -> str:
+    """Bindet ein VORHANDENES Bild-/Logo-Asset (per ID aus list_image_assets) an eine PMax-Asset-Gruppe.
+    field_type fuer PMax: LOGO (1:1, >=128px), LANDSCAPE_LOGO (4:1), MARKETING_IMAGE (1.91:1, >=600x314),
+    SQUARE_MARKETING_IMAGE (1:1, >=300x300), PORTRAIT_MARKETING_IMAGE (4:5, >=480x600).
+    """
+    client = get_client()
+    cid = customer_id or DEFAULT_CUSTOMER_ID
+    asset_svc = client.get_service("AssetService")
+    rn = asset_svc.asset_path(cid, asset_id)
+    out = _agasset_link(client, cid, asset_group_id, rn, field_type)
+    return json.dumps({"dry_run": DRY_RUN, "linked": out, "field_type": field_type, "asset_group_id": asset_group_id})
+
+
+@mcp.tool()
+def add_text_to_asset_group(asset_group_id: str, texts: list[str], field_type: str = "HEADLINE", customer_id: str = "") -> str:
+    """Legt Text-Assets an und bindet sie an eine PMax-Asset-Gruppe.
+    field_type: HEADLINE (<=30 Z.), LONG_HEADLINE (<=90 Z.), DESCRIPTION (<=90 Z.),
+    LONG_DESCRIPTION (<=90 Z.), BUSINESS_NAME (<=25 Z.).
+    Wichtig: KEIN 'Botox' in Texten (Markenname -> Disapproval); 'Muskelrelaxans'/'Faltenbehandlung' nutzen.
+    """
+    client = get_client()
+    cid = customer_id or DEFAULT_CUSTOMER_ID
+    # 1) Assets anlegen
+    asset_svc = client.get_service("AssetService")
+    ops = []
+    for t in texts:
+        op = client.get_type("AssetOperation")
+        op.create.text_asset.text = t
+        ops.append(op)
+    req = client.get_type("MutateAssetsRequest")
+    req.customer_id = cid
+    req.operations.extend(ops)
+    req.validate_only = DRY_RUN
+    resp = asset_svc.mutate_assets(request=req)
+    rns = [r.resource_name for r in resp.results]
+    # 2) an Asset-Gruppe binden
+    linked = []
+    for rn in rns:
+        linked.append(_agasset_link(client, cid, asset_group_id, rn, field_type))
+    return json.dumps({"dry_run": DRY_RUN, "created": len(rns), "linked": len([x for x in linked if x]), "field_type": field_type, "asset_group_id": asset_group_id})
+
+
+@mcp.tool()
+def add_asset_group_signal(asset_group_id: str, search_themes: list[str], customer_id: str = "") -> str:
+    """Fuegt Such-Themen-Signale (Search Themes) zu einer PMax-Asset-Gruppe hinzu.
+    search_themes: enge, themen-genaue Suchbegriffe, z.B. ['vitamin c infusion aachen','glutathion infusion'].
+    Signale lenken die PMax-KI auf die richtige Suchintention.
+    """
+    client = get_client()
+    cid = customer_id or DEFAULT_CUSTOMER_ID
+    ag_svc = client.get_service("AssetGroupService")
+    svc = client.get_service("AssetGroupSignalService")
+    ops = []
+    for t in search_themes:
+        op = client.get_type("AssetGroupSignalOperation")
+        op.create.asset_group = ag_svc.asset_group_path(cid, asset_group_id)
+        op.create.search_theme.text = t
+        ops.append(op)
+    req = client.get_type("MutateAssetGroupSignalsRequest")
+    req.customer_id = cid
+    req.operations.extend(ops)
+    req.validate_only = DRY_RUN
+    resp = svc.mutate_asset_group_signals(request=req)
+    return json.dumps({"dry_run": DRY_RUN, "added": len(resp.results), "asset_group_id": asset_group_id})
+
+
+@mcp.tool()
+def list_asset_group_assets(asset_group_id: str, customer_id: str = "") -> str:
+    """Listet alle Assets einer PMax-Asset-Gruppe nach field_type mit Anzahl + Approval-Status.
+    Zum Pruefen, was fehlt (z.B. LOGO, BUSINESS_NAME) oder disapproved ist.
+    """
+    client = get_client()
+    cid = customer_id or DEFAULT_CUSTOMER_ID
+    ga = client.get_service("GoogleAdsService")
+    q = ("SELECT asset_group_asset.field_type, asset_group_asset.status, "
+         "asset_group_asset.policy_summary.approval_status, asset.id, asset.type "
+         f"FROM asset_group_asset WHERE asset_group.id={asset_group_id}")
+    counts = {}
+    for b in ga.search_stream(customer_id=cid, query=q):
+        for r in b.results:
+            ft = r.asset_group_asset.field_type.name
+            ap = r.asset_group_asset.policy_summary.approval_status.name
+            d = counts.setdefault(ft, {})
+            d[ap] = d.get(ap, 0) + 1
+    return json.dumps({"asset_group_id": asset_group_id, "by_field_type": counts}, ensure_ascii=False)
+
+
+@mcp.tool()
+def remove_asset_group_asset(asset_group_id: str, asset_id: str, field_type: str = "HEADLINE", customer_id: str = "") -> str:
+    """Entfernt (loescht) die Verknuepfung eines Assets von einer PMax-Asset-Gruppe (AssetGroupAsset remove).
+    asset_id aus run_gaql_report (asset.id), field_type = HEADLINE/LONG_HEADLINE/DESCRIPTION/
+    BUSINESS_NAME/MARKETING_IMAGE/SQUARE_MARKETING_IMAGE/PORTRAIT_MARKETING_IMAGE/LOGO etc.
+    Das Asset selbst bleibt in der Bibliothek; nur die Bindung an die Gruppe wird geloescht.
+    Nutzen: disapproved/limitierte Texte aus einer aktiven Gruppe rausnehmen.
+    """
+    client = get_client()
+    cid = customer_id or DEFAULT_CUSTOMER_ID
+    svc = client.get_service("AssetGroupAssetService")
+    op = client.get_type("AssetGroupAssetOperation")
+    op.remove = f"customers/{cid}/assetGroupAssets/{asset_group_id}~{asset_id}~{field_type}"
+    req = client.get_type("MutateAssetGroupAssetsRequest")
+    req.customer_id = cid
+    req.operations.append(op)
+    req.validate_only = DRY_RUN
+    resp = svc.mutate_asset_group_assets(request=req)
+    removed = resp.results[0].resource_name if resp.results else None
+    return json.dumps({"dry_run": DRY_RUN, "removed": removed, "asset_group_id": asset_group_id, "asset_id": asset_id, "field_type": field_type})
+
+
+@mcp.tool()
+def update_asset_group_final_url(asset_group_id: str, final_url: str, final_mobile_url: str = "", customer_id: str = "") -> str:
+    """Aendert die Final-URL(s) einer PMax-Asset-Gruppe (asset_group.final_urls).
+    Damit eine Gruppe auf die richtige Landingpage zeigt (z.B. Jawline -> /hyaluron/jawline
+    statt Uebersicht /hyaluron). final_url = Pflicht-Ziel-URL; final_mobile_url optional.
+    asset_group_id per run_gaql_report finden
+    ("SELECT asset_group.id, asset_group.name, asset_group.final_urls FROM asset_group WHERE campaign.id=...").
+    """
+    client = get_client()
+    cid = customer_id or DEFAULT_CUSTOMER_ID
+    svc = client.get_service("AssetGroupService")
+    op = client.get_type("AssetGroupOperation")
+    ag = op.update
+    ag.resource_name = svc.asset_group_path(cid, asset_group_id)
+    ag.final_urls.append(final_url)
+    if final_mobile_url:
+        ag.final_mobile_urls.append(final_mobile_url)
+    client.copy_from(op.update_mask, protobuf_helpers.field_mask(None, ag._pb))
+    req = client.get_type("MutateAssetGroupsRequest")
+    req.customer_id = cid
+    req.operations.append(op)
+    req.validate_only = DRY_RUN
+    resp = svc.mutate_asset_groups(request=req)
+    return json.dumps({"dry_run": DRY_RUN, "resource_name": resp.results[0].resource_name if resp.results else None, "final_url": final_url, "final_mobile_url": final_mobile_url or None})
+
+
+# --- HTTP-App mit Bearer-Auth ---
+class BearerAuthMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        # /healthz ohne Auth (für Monitoring)
+        if request.url.path.rstrip("/").endswith("healthz"):
+            return await call_next(request)
+        token = os.environ.get("CONNECTOR_TOKEN")
+        if token:
+            # Akzeptiere Token via Header (Authorization: Bearer ...) ODER via
+            # Query-Param (?token=...), weil Claudes Connector-Dialog kein
+            # Header-Feld bietet.
+            header_ok = request.headers.get("authorization", "") == f"Bearer {token}"
+            query_ok = request.query_params.get("token", "") == token
+            if not (header_ok or query_ok):
+                return JSONResponse({"error": "unauthorized"}, status_code=401)
+        return await call_next(request)
+
+
+app = mcp.streamable_http_app()  # MCP-Endpoint unter /mcp
+
+
+async def _healthz(_req):
+    return PlainTextResponse("ok")
+
+
+app.router.routes.append(Route("/healthz", _healthz))
+app.add_middleware(BearerAuthMiddleware)
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="127.0.0.1", port=int(os.environ.get("PORT", "8080")))
