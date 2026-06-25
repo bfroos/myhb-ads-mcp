@@ -22,6 +22,10 @@ Sicherheit:
 import os
 import json
 from functools import lru_cache
+import subprocess
+import tempfile
+import shutil
+import pathlib
 
 from google.protobuf.json_format import MessageToDict
 from google.api_core import protobuf_helpers
@@ -1042,6 +1046,92 @@ def attach_brand_exclusion_list(campaign_id: str, shared_set_id: str, customer_i
     return json.dumps({"dry_run": DRY_RUN, "resource_name": resp.results[0].resource_name if resp.results else None, "shared_set_id": shared_set_id, "campaign_id": campaign_id})
 
 
+
+
+# ===== REPO_COMMIT_FILE TOOL: Claude kann den MCP-Server selbst erweitern =====
+REPO_SLUG = "bfroos/myhb-ads-mcp"
+
+@mcp.tool()
+def repo_commit_file(path: str, content: str, message: str, branch: str = "main") -> str:
+    """Schreibt/aktualisiert eine Datei im MCP-Repo (bfroos/myhb-ads-mcp) und pusht sie nach GitHub.
+    Loest dadurch den Webhook-Auto-Deploy aus -> ermoeglicht Claude, den MCP-Server selbst zu erweitern.
+    path: Pfad relativ zur Repo-Wurzel (kein fuehrendes '/', kein '..'). 
+    content: kompletter Dateiinhalt.
+    message: Commit-Message. 
+    branch: Default 'main'. 
+    Token kommt aus ENV GITHUB_PUSH_TOKEN (server-seitig).
+    """
+    # Sicherheitsschalter
+    if os.environ.get("REPO_EDIT_ENABLED", "0") != "1":
+        return json.dumps({"error": "Self-Edit deaktiviert (REPO_EDIT_ENABLED != 1)"})
+    
+    token = os.environ.get("GITHUB_PUSH_TOKEN", "")
+    if not token:
+        return json.dumps({"error": "GITHUB_PUSH_TOKEN ist auf dem Server nicht gesetzt"})
+    
+    # Pfad-Sicherheit (kein Ausbrechen aus dem Repo)
+    parts = pathlib.PurePosixPath(path).parts
+    if path.startswith("/") or ".." in parts or path.strip() == "":
+        return json.dumps({"error": "ungueltiger Pfad"})
+    
+    remote = f"https://x-access-token:{token}@github.com/{REPO_SLUG}.git"
+
+    def _scrub(s):
+        """Token in Fehlermeldungen maskieren"""
+        return s.replace(token, "***") if token else s
+
+    tmp = tempfile.mkdtemp(prefix="repoedit-")
+    try:
+        # Clone mit depth=1 (schneller)
+        result = subprocess.run(
+            ["git", "clone", "--depth", "1", "--branch", branch, remote, tmp],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode != 0:
+            return json.dumps({"error": _scrub(f"git clone: {result.stderr.strip()}"), "repo": REPO_SLUG})
+        
+        # Datei schreiben
+        target = pathlib.Path(tmp) / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        
+        # Git konfigurieren
+        subprocess.run(["git", "-C", tmp, "config", "user.email", "claude@myhb.app"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", tmp, "config", "user.name", "Claude (MCP self-edit)"], check=True, capture_output=True)
+        
+        # Add + prüfen ob Änderung
+        subprocess.run(["git", "-C", tmp, "add", path], check=True, capture_output=True)
+        status = subprocess.run(["git", "-C", tmp, "status", "--porcelain"], capture_output=True, text=True).stdout.strip()
+        if not status:
+            return json.dumps({"committed": False, "note": "keine Aenderung (Inhalt identisch)", "path": path})
+        
+        # Commit
+        commit_result = subprocess.run(
+            ["git", "-C", tmp, "commit", "-m", message],
+            capture_output=True, text=True, timeout=10
+        )
+        if commit_result.returncode != 0:
+            return json.dumps({"error": _scrub(commit_result.stderr.strip())})
+        
+        sha = subprocess.run(["git", "-C", tmp, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+        
+        # Push
+        push_result = subprocess.run(
+            ["git", "-C", tmp, "push", "origin", branch],
+            capture_output=True, text=True, timeout=30
+        )
+        if push_result.returncode != 0:
+            return json.dumps({"error": _scrub(push_result.stderr.strip())})
+        
+        return json.dumps({"committed": True, "branch": branch, "path": path, "commit": sha, "repo": REPO_SLUG})
+    
+    except Exception as e:
+        return json.dumps({"error": _scrub(str(e))})
+    
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 # --- HTTP-App mit Bearer-Auth ---
 class BearerAuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
@@ -1050,9 +1140,8 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
         token = os.environ.get("CONNECTOR_TOKEN")
         if token:
-            # Akzeptiere Token via Header (Authorization: Bearer ...) ODER via
-            # Query-Param (?token=...), weil Claudes Connector-Dialog kein
-            # Header-Feld bietet.
+            # Akzeptiere Token via Header (Authorization: Bearer ***) ODER via
+            # Query-Param (?token=***) — Claude-Connector-Dialog hat kein Header-Feld
             header_ok = request.headers.get("authorization", "") == f"Bearer {token}"
             query_ok = request.query_params.get("token", "") == token
             if not (header_ok or query_ok):
