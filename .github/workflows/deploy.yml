@@ -8,6 +8,12 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Test Python syntax
+        run: python3 -m py_compile server.py
+
       - name: Deploy via SSH
         uses: appleboy/ssh-action@v1.0.3
         with:
@@ -17,14 +23,10 @@ jobs:
           script: |
             cd /opt/google-ads-mcp
             git pull origin main --ff-only
-            # Test Python syntax
             python3 -m py_compile server.py
-            # Restart service
             sudo systemctl restart google-ads-mcp
-            # Health check
             sleep 2
-            curl -s -H "Authorization: Bearer ${CONNECTOR_TOKEN}" http://127.0.0.1:8090/health || echo "Health check pending..."
+            systemctl status google-ads-mcp
 
-      - name: Notify on failure
-        if: failure()
-        run: echo "Deployment failed!"
+      - name: Success
+        run: echo "✅ Deploy successful!"
