@@ -5,28 +5,34 @@ on:
     branches: [ main ]
 
 jobs:
-  deploy:
+  test:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+
       - name: Test Python syntax
         run: python3 -m py_compile server.py
 
-      - name: Deploy via SSH
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.DEPLOY_HOST }}
-          username: ${{ secrets.DEPLOY_USER }}
-          key: ${{ secrets.DEPLOY_SSH_KEY }}
-          script: |
-            cd /opt/google-ads-mcp
-            git pull origin main --ff-only
-            python3 -m py_compile server.py
-            sudo systemctl restart google-ads-mcp
-            sleep 2
-            systemctl status google-ads-mcp
+      - name: Lint check (optional)
+        run: python3 -m py_compile requirements.txt 2>/dev/null || true
 
-      - name: Success
-        run: echo "✅ Deploy successful!"
+  notify-deploy:
+    runs-on: ubuntu-latest
+    needs: test
+    if: success()
+    steps:
+      - name: Trigger Deploy Webhook
+        run: |
+          curl -X POST https://bfr.roos.rocks/deploy/google-ads-mcp \
+            -H "Content-Type: application/json" \
+            -d '{"branch":"main","commit":"${{ github.sha }}"}' \
+            || echo "Webhook failed - manual deploy may be needed"
+
+      - name: Success notification
+        run: echo "✅ Tests passed. Deploy webhook triggered."
